@@ -1,0 +1,393 @@
+---
+title: "ISYE7406 HW3"
+author: "Brian Nutwell"
+date: '2023-02-08'
+output:
+  html_document: default
+  pdf_document: default
+---
+
+Setup code
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(class)        # for KNN function
+library(pheatmap)     # pretty heatmaps
+library(RColorBrewer) # color palettes for heatmaps and plotly
+library(plotly)
+
+library(outliers)     # grubbs.test(data,type=10,21...)
+library(psych)        # useful pairs.panels correlation graphic
+
+library(MASS)         # for Ridge regression, LDA, QDA
+library(lars)         # for LASSO regression
+library(pls)          # for Principal Component Regression
+library(e1071)        # for Naive Bayes
+
+library(randomForest) # for Random Forest
+library(gbm)          # for Boosting (multinomial doesn't work)
+library(caret)          # for Boosting
+
+library(neuralnet)
+
+library(dplyr)
+
+# clear environment memory of all objects
+rm(list=ls())
+
+# set seed for random number generation
+set.seed(222)
+
+```
+
+Import and inspect the MAESTRO data metadata and scale tone durations file
+
+```{r}
+filepath = "C:\\Personal Projects\\MusicAgent"
+
+music_feat_data <- as.data.frame(read.table(file=paste0(filepath,"\\MIDIextracts\\song_features.csv"), sep=",", header=TRUE))
+
+music_metadata <- as.data.frame(read.table(file=paste0(filepath,"\\MAESTRO metadata expanded2.csv"), sep=",", header=TRUE, fill=TRUE))
+music_eras <- read.table(file=paste0(filepath,"\\MAESTRO eras.csv"), sep=",", header=TRUE)
+
+
+print(unique(music_metadata$era.index))
+numNArows <- sum(is.na(music_metadata$era.index))
+NArows <- which(is.na(music_metadata$era.index))
+music_feat_data <- music_feat_data[-NArows,]
+music_metadata <- music_metadata[-NArows,]
+
+mf_data <- music_feat_data[,!names(music_feat_data) %in% c("X")]
+tones = colnames(mf_data)
+
+m <- nrow(music_feat_data)
+
+# add the high-level era index from the metadata file
+#mf_data["era_index"] <- music_metadata["era.index"]
+mf_data["era_index"] <- 0
+
+# add the broader era index by looking up from the era file
+for (i in seq(m)) {
+  a <- music_metadata[i,"era.index"]
+  b <- min(music_eras[which(music_eras$Index==a),"Index2"])
+  mf_data[i,"era_index"] <- b
+}
+
+print(table(mf_data$era_index))
+
+
+# data cleanup: consolidate eras, eliminate small-n eras, try to balance classes
+
+
+```
+
+
+```{r}
+
+# correlation of columns in the dataframe
+cormat <- cor(mf_data[,1:12],method='pearson')
+
+# heatmap of correlations
+hmc <- pheatmap(cormat,color=colorRampPalette(brewer.pal(n=5,name='Blues'))(100),
+         cluster_rows = FALSE, cluster_cols = FALSE ,
+         labels_col = colnames(cormat),labels_row = rownames(cormat),
+         main='Correlation Magnitude Between Scale Tone Prevalence',legend= TRUE,
+         display_numbers=TRUE,number_color = "grey")
+hmc
+
+# inspect correlated pair scatter plots
+pairs(mf_data[,1:12])
+pairs.panels(mf_data[,1:12])
+
+# inspect boxplots
+#boxplot(mf_data[,1:12])
+
+box1 <- plot_ly(
+        y = mf_data$X1,
+        name = tones[1],
+        type = "box"
+        )
+for (t in tones[2:12]) {
+        box1 <- box1 %>% add_trace(y=mf_data[,t],name=t)
+}
+box1 <- box1 %>% layout(
+        title = "\nDistribution of scale tones",
+        xaxis = list(title = "Scale Tone",type="category",categoryorder='array', categoryarray= tones),
+        yaxis = list(title = "Prevalence"),
+        barmode = 'group'
+        )
+box1 
+
+# subset rows of data for training,test & validation
+# according to the MAESTRO dataset proposal
+#mf_train <- mf_data[music_metadata$split=="train",]
+#mf_test <- mf_data[music_metadata$split=="test",]
+#mf_valid <- mf_data[music_metadata$split=="validation",]
+
+# or randomly
+set.seed = 126
+testrows <- sample(m,size = round(m/5),replace=FALSE,prob=rep(1/m,m))
+mf_test <- mf_data[testrows,]
+mf_train <- mf_data[-testrows,]
+
+table(mf_test$era_index)
+table(mf_train$era_index)
+
+hist(mf_train$era_index)
+hist(mf_test$era_index)
+
+```
+Visualize the variance of each notes vs. different eras
+
+```{r}
+
+music_majoreras = c("Baroque","Classical","Romantic","Modern")
+
+for (t in tones[1:12]) {
+  
+  box1 <- plot_ly(
+          y = mf_data[mf_data$era_index==3,t],
+          name = music_majoreras[1],
+          type = "box"
+          )
+  for (era in seq(4:6)+3)
+          {
+          print(era)
+          box1 <- box1 %>% add_trace(y=mf_data[mf_data$era_index==era,t],name=music_majoreras[era-2])
+          }
+  box1 <- box1 %>% layout(
+          title = paste("\nDist of scale tone",t," by era"),
+          xaxis = list(title = "Scale Tone",type="category",categoryorder='array', categoryarray= tones),
+          yaxis = list(title = "Prevalence"),
+          barmode = 'group'
+          )
+  show(box1)
+}
+
+
+```
+
+
+Function to evaluate results
+
+```{r}
+
+eval_preds <- function(preds,testdata) {
+  #evalmtx <- matrix(0,nrow=length(preds),ncol=3)
+  #evalmtx$predicted <- preds
+  #evalmtx$actual <- testdata
+  #print(preds)
+  #print(testdata)
+  correct <- sum(preds == testdata) / length(testdata)
+  #print(correct)
+  #evalmtx$correct <- (preds == testdata)
+  #print(evalmtx)
+  return(correct)
+}
+
+```
+
+Construct each model once and inspect it
+
+```{r}
+
+# logistic regression
+mf_logreg <- glm(era_index~., family=gaussian(link=identity), data=mf_train)
+pred_logreg <- round(predict(mf_logreg,mf_test))
+correct_logreg <- sum(pred_logreg == mf_test$era_index) /  nrow(mf_test)
+table(mf_test$era_index,pred_logreg)
+
+# random forest
+rf_trees <- c(100,300,500,1000,2000,5000)
+rf_accy <- rep(0,times = 6)
+for (j in seq(1:10)) {
+  print(j)
+  for (i in seq(1:6)) {
+    # random forest
+    mf_rf <- randomForest(as.factor(era_index) ~.,
+                          data=mf_train, 
+                          importance=TRUE,
+                          type="classification",
+                          ntree=rf_trees[i])
+    #importance(mf_rf)         # mean decrease in accuracy
+    #importance(mf_rf, type=2) # mean decrease in node impurity
+    #varImpPlot(mf_rf)
+    pred_rf <- predict(mf_rf, mf_test, type='class')
+    #class_rf <- as.integer(pred_rf)
+    correct_rf <- sum(pred_rf == mf_test$era_index) / nrow(mf_test)
+    rf_accy[i] <- rf_accy[i] + correct_rf
+    
+    #table(pred_rf, mf_test$era_index)
+  }
+}
+print(rf_accy/10)
+# number of trees doesn't have a consistent effect on accuracy
+matplot(rf_trees, 1-rf_accy/10, "o", ylim=c(0, 0.3), ylab="Error Rate",
+        xlab="Number of Random Forest trees",lwd=3,col="blue")
+# run once more with selected # trees
+mf_rf <- randomForest(as.factor(era_index) ~.,
+                      data=mf_train, 
+                      importance=TRUE,
+                      type="classification",
+                      ntree=500)
+pred_rf <- predict(mf_rf, mf_test, type='class')
+correct_rf <- sum(pred_rf == mf_test$era_index) / nrow(mf_test)
+table(pred_rf, mf_test$era_index)
+importance(mf_rf)
+varImpPlot(mf_rf)
+
+
+# boosting -- can't use gmb for multiclass, so try caret
+mf_boost <- train(as.factor(era_index) ~ ., data = mf_train, 
+                method = "gbm",
+                verbose = FALSE
+                )
+pred_boost = predict(mf_boost,mf_test,type="raw")
+correct_boost <- sum(pred_boost == mf_test$era_index) /  nrow(mf_test)
+table(mf_test$era_index,pred_boost)
+mf_boost
+# caret package recommend n.trees = 150, interaction.depth = 3, shrinkage = 0.1, minobs = 10
+
+
+# KNN
+# run knn - predict test labels from k nearest neighbors in training dataset
+pred_knn <- knn(mf_train[,1:12],mf_test[,1:12],mf_train$era_index,k=1)
+correct_knn <- sum(pred_knn == mf_test$era_index) /  nrow(mf_test)
+table(pred_knn, mf_test$era_index)
+
+# linear discriminant analysis
+mf_lda <- lda(era_index~., data=mf_train)
+pred_lda <- predict(mf_lda,mf_test)
+class_lda <- pred_lda$class
+correct_lda <- sum(class_lda == mf_test$era_index) /  nrow(mf_test)
+table(pred_lda$class, mf_test$era_index)
+
+# quadratic discriminant analysis
+mf_qda <- qda(era_index~., data=mf_train, method = "mle")
+pred_qda <- predict(mf_qda,mf_test)
+#class_qda <- as.numeric(pred_qda$class)
+correct_qda <- sum(pred_qda$class == mf_test$era_index) / nrow(mf_test)
+table(pred_qda$class, mf_test$era_index)
+
+# neural network
+mf_train2 <- mf_train %>%
+  mutate(era_index=as.factor(era_index))
+
+
+mf_nn <- neuralnet(era_index~., hidden = c(10,10), data=mf_train2, linear.output=FALSE)
+pred_nn <- predict(mf_nn,mf_test)
+pred_nn_class <- apply(pred_nn, 1, which.max)
+
+correct_nn <- sum(pred_nn_class+2 == mf_test$era_index) / nrow(mf_test)
+table(pred_nn_class+2, mf_test$era_index)
+
+
+
+```
+Cross Validation loops
+
+```{r}
+# number of trials for cross validation
+B = 10
+m2 = nrow(mf_train)
+
+# create a data structure for the CV trial results
+modeltypes <- c("LDA","QDA","LogisticReg","KNN","RandomForest","Boosting")
+CV_trials <- data.frame(matrix(0,nrow=B,ncol=length(modeltypes)))
+colnames(CV_trials) <- modeltypes
+
+for (b in seq(1:B)) {
+  if (b%%5==1){
+    print(paste("Running Loop ",b))    
+  }
+
+  # subset rows of training data for tuning
+  testrows <- sample(m2,size = round(m2/5),replace=FALSE,prob=rep(1/m2,m2))
+  mf_train_cv <- mf_train[-testrows,]
+  mf_test_cv <- mf_train[testrows,]
+  mtrain <- nrow(mf_train_cv)
+  mtest <- nrow(mf_test_cv)
+  answers <- mf_test_cv$era_index
+
+  # random forest
+  mf_rf <- randomForest(as.factor(era_index) ~.,
+                        data=mf_train_cv, 
+                        importance=TRUE,
+                        type="classification",
+                        ntree=500)
+  importance(mf_rf)         # mean decrease in accuracy
+  importance(mf_rf, type=2) # mean decrease in node impurity
+  varImpPlot(mf_rf)
+  pred_rf <- predict(mf_rf, mf_test_cv, type='class')
+  CV_trials$RandomForest[b] <- eval_preds(pred_rf,answers)
+  
+  # boosting -- can't use gmb for multiclass, so try caret
+  mf_boost <- train(as.factor(era_index) ~ ., data = mf_train_cv, 
+                method = "gbm",
+                verbose = FALSE
+                )
+  pred_boost = predict(mf_boost,mf_test_cv,type="raw")
+  CV_trials$Boosting[b] <- eval_preds(pred_boost,answers)
+
+  # logistic regression
+  mf_logreg <- glm(era_index~., family=gaussian(link=identity), data=mf_train_cv)
+  pred_logreg <- round(predict(mf_logreg,mf_test_cv))
+  CV_trials$LogisticReg[b] <- eval_preds(pred_logreg,answers)
+
+  # linear discriminant analysis
+  mf_lda <- lda(era_index~., data=mf_train_cv)
+  pred_lda <- predict(mf_lda,mf_test_cv)
+  CV_trials$LDA[b] <- eval_preds(pred_lda$class,answers)
+  
+  # quadratic discriminant analysis
+  mf_qda <- qda(era_index~., data=mf_train_cv, method = "mle")
+  pred_qda <- predict(mf_qda,mf_test_cv)
+  CV_trials$QDA[b] <- eval_preds(pred_qda$class,answers)
+  
+  # KNN
+  pred_knn <- knn(mf_train_cv[,1:12],mf_test_cv[,1:12],mf_train_cv$era_index,k=3)
+  CV_trials$KNN[b] <- eval_preds(pred_knn,answers)
+
+}
+
+CV_means <- colMeans(CV_trials)
+CV_box1 <- 1-colMeans(CV_trials)
+print(round(CV_box1,6))
+boxplot(1-CV_trials)
+
+```
+Inspect output
+
+```{r}
+
+CV_err <- 1-round(CV_trials,3)
+
+# Summarize test errors on a bar chart
+errors <- plot_ly(
+          y = ~CV_err$LDA,
+          name = "LDA",
+          type = "box",
+          text = ~CV_err$LDA
+          )
+errors <- errors %>% add_trace(y = ~CV_err$QDA, name = 'QDA', text = ~CV_err$QDA)
+errors <- errors %>% add_trace(y = ~CV_err$LogisticReg, name = 'LogisticReg', text = ~CV_err$LogisticReg)
+errors <- errors %>% add_trace(y = ~CV_err$KNN, name = 'KNN', text = ~CV_err$KNN)
+errors <- errors %>% add_trace(y = ~CV_err$Boosting, name = 'Boosting', text = ~CV_err$Boosting)
+errors <- errors %>% add_trace(y = ~CV_err$RandomForest, name = 'RandomForest', text = ~CV_err$RandomForest)
+errors <- errors %>% layout(
+          title = "\nCV Accuracy for various Classification Methods",
+          xaxis = list(title = "Model",type="category",categoryorder='array', categoryarray= modeltypes),
+          yaxis = list(title = "Mean Test Error, 100 trials",range = list(0, 0.7)),
+          barmode = 'group'
+          )
+errors
+
+
+
+```
+
+```{r}
+auto_logreg$coefficients
+```
+
