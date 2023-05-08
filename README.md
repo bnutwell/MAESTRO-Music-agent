@@ -1,5 +1,6 @@
 # MAESTRO-Music-agent
 Data mining project to predict classical music era from MIDI data
+
 Originally performed as a class project for Georgia Tech graduate course ISYE7406 Data Mining & Statistical Learning
 
 This analysis was performed on the MAESTRO dataset of classical music piano performances, sourced from:
